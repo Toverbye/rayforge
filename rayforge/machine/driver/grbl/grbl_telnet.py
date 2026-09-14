@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from gettext import gettext as _
 from typing import Any, cast
@@ -5,7 +6,7 @@ from typing import Any, cast
 from ....core.varset import HostnameVar, IntVar, PortVar, Var, VarSet
 from ....core.varset.hostnamevar import is_valid_hostname_or_ip
 from ...transport import TelnetTransport
-from ...transport.grbl import GrblSerialTransport
+from ...transport.grbl import BufferStallError, GrblSerialTransport
 from ..driver import DriverPrecheckError, DriverSetupError
 from .grbl_serial import GrblSerialDriver
 
@@ -33,6 +34,7 @@ class GrblTelnetDriver(GrblSerialDriver):
         super().__init__(context, machine)
         self._host: str | None = None
         self._port: int | None = None
+        self._ping_pong = False
 
     @property
     def resource_uri(self) -> str | None:
@@ -101,6 +103,18 @@ class GrblTelnetDriver(GrblSerialDriver):
                     min_val=0,
                     max_val=1024,
                 ),
+                Var(
+                    key="ping_pong",
+                    label=_("Ping-pong streaming"),
+                    description=_(
+                        "Send one line at a time and wait for its "
+                        "acknowledgement. Much slower, but robust "
+                        "against WiFi bridges that return duplicate "
+                        "'ok' responses or corrupt streamed data."
+                    ),
+                    var_type=bool,
+                    default=False,
+                ),
             ]
         )
 
@@ -116,6 +130,7 @@ class GrblTelnetDriver(GrblSerialDriver):
         self._rx_buffer_size_override = int(
             kwargs.get("rx_buffer_size_override", 0) or 0
         )
+        self._ping_pong = bool(kwargs.get("ping_pong", False))
 
         if not host:
             raise DriverSetupError(_("Hostname must be configured."))
@@ -131,3 +146,49 @@ class GrblTelnetDriver(GrblSerialDriver):
         self.grbl_transport.status_changed.connect(
             self.on_serial_status_changed
         )
+
+    async def _send_gcode_line(
+        self,
+        transport,
+        line: str,
+        command_bytes: bytes,
+        op_index: int | None,
+        timeout: float,
+    ) -> None:
+        """Send a single gcode line, optionally ping-pong style.
+
+        In ping-pong mode each line waits until its acknowledgement
+        drains the pending queue, so at most one or two lines are
+        ever outstanding. Duplicate 'ok' responses then only cause
+        harmless surplus-ack warnings instead of buffer desync.
+        """
+        if not self._ping_pong:
+            await super()._send_gcode_line(
+                transport, line, command_bytes, op_index, timeout
+            )
+            return
+        async with self._cmd_lock:
+            if not self.grbl_transport or not self.grbl_transport.is_connected:
+                raise ConnectionError(
+                    "Serial transport disconnected during job."
+                )
+            logger.info(line, extra=self._log_extra("USER_COMMAND"))
+            await transport.send_gcode(
+                command_bytes,
+                op_index,
+                timeout=timeout,
+                on_stall=self._on_buffer_stall,
+            )
+            while not transport.pending_queue.empty():
+                try:
+                    await transport.wait_all_pending(timeout=timeout)
+                except asyncio.TimeoutError:
+                    handled = await self._on_buffer_stall(
+                        transport, len(command_bytes)
+                    )
+                    if not handled:
+                        raise BufferStallError(
+                            f"Ping-pong ack timeout for {line!r} "
+                            f"(buf: {transport.buffer_count}/"
+                            f"{transport._rx_buffer_size})"
+                        )

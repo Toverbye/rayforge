@@ -64,6 +64,7 @@ class GrblSerialTransport:
     def __init__(self, transport: Transport):
         self._transport = transport
         self._rx_buffer_count = 0
+        self._surplus_ack_count = 0
         self._rx_buffer_size = DEFAULT_GRBL_RX_BUFFER_SIZE
         self._lock = threading.Lock()
         self._pending: asyncio.Queue[PendingCommand] = asyncio.Queue()
@@ -434,7 +435,21 @@ class GrblSerialTransport:
         try:
             pending = self._pending.get_nowait()
         except asyncio.QueueEmpty:
-            logger.warning("Received ack but sent gcode queue was empty.")
+            self._surplus_ack_count += 1
+            if self._surplus_ack_count == 1:
+                logger.warning(
+                    "Received ack but sent gcode queue was empty "
+                    "(surplus ack #1). The device is returning more "
+                    "'ok' responses than commands sent, often caused "
+                    "by a WiFi/telnet bridge duplicating line endings. "
+                    "Buffer accounting may desynchronize; consider "
+                    "ping-pong streaming if jobs fail."
+                )
+            else:
+                logger.warning(
+                    "Received ack but sent gcode queue was empty "
+                    f"(surplus ack #{self._surplus_ack_count})."
+                )
             return None
         logger.debug(
             f"Buffer ack: freeing {pending.length} bytes for "
@@ -467,6 +482,12 @@ class GrblSerialTransport:
         """Reset all buffer state (cancel, reconnect, cleanup)."""
         self.reset_flow_control()
         self._status_buffer = bytearray()
+        self._surplus_ack_count = 0
+
+    @property
+    def surplus_ack_count(self) -> int:
+        """Number of acks received with no matching sent command."""
+        return self._surplus_ack_count
 
     def signal_space_available(self) -> None:
         """Unblock any waiters (e.g. on cancel)."""
