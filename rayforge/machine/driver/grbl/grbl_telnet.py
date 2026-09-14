@@ -2,7 +2,7 @@ import logging
 from gettext import gettext as _
 from typing import Any, cast
 
-from ....core.varset import HostnameVar, PortVar, Var, VarSet
+from ....core.varset import HostnameVar, IntVar, PortVar, Var, VarSet
 from ....core.varset.hostnamevar import is_valid_hostname_or_ip
 from ...transport import TelnetTransport
 from ...transport.grbl import GrblSerialTransport
@@ -87,6 +87,20 @@ class GrblTelnetDriver(GrblSerialDriver):
                     var_type=bool,
                     default=False,
                 ),
+                IntVar(
+                    key="rx_buffer_size_override",
+                    label=_("RX Buffer Size Override"),
+                    description=_(
+                        "Force a specific RX buffer size in bytes. "
+                        "Set to 0 to auto-detect from the device. "
+                        "Lower this (e.g. to 50) if jobs fail over "
+                        "WiFi with garbled-line errors such as "
+                        "error:21."
+                    ),
+                    default=0,
+                    min_val=0,
+                    max_val=1024,
+                ),
             ]
         )
 
@@ -98,6 +112,9 @@ class GrblTelnetDriver(GrblSerialDriver):
         )
         self._deadlock_detection = bool(
             kwargs.get("deadlock_detection", False)
+        )
+        self._rx_buffer_size_override = int(
+            kwargs.get("rx_buffer_size_override", 0) or 0
         )
 
         if not host:
